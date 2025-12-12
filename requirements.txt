@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+numpy
+openseespy==3.7.1.2

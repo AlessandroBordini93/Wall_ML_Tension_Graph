@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: wall-pushover-service
+    plan: free
+    runtime: docker
+    region: frankfurt
+    dockerfilePath: Dockerfile
