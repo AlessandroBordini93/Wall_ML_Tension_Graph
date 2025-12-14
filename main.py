@@ -1,7 +1,8 @@
 # main.py
 import io
+import time
 import contextlib
-from typing import Any, Dict, List, Tuple, Union, Optional
+from typing import Any, Dict, List, Tuple, Optional, Union
 
 import numpy as np
 from fastapi import FastAPI, Request
@@ -11,13 +12,11 @@ import openseespy.opensees as ops
 
 
 # ============================================================
-#  COSTANTI GLOBALI
+#  COSTANTI GEOMETRICHE (fisse)
 # ============================================================
 
 L = 4.0
 H = 6.0
-
-TARGET_DISP_MM = 15.0
 
 CORDOLI_Y = [
     (2.7, 3.0),
@@ -25,73 +24,146 @@ CORDOLI_Y = [
 ]
 
 MARGIN = 0.30
-PIER_MIN = 0.30  # maschio orizzontale minimo
-
-# Mesh conforming: passo massimo (più grande => mesh più grossa/veloce)
-MAX_DX_DEFAULT = 0.10
-MAX_DY_DEFAULT = 0.10
+PIER_MIN = 0.30
 
 
 # ============================================================
-#  HELPERS: parsing robusto da body/query
+#  DEFAULT "PRODUZIONE" (Render-friendly)
 # ============================================================
 
-def _as_int01(v: Any, default: int = 0) -> int:
-    """Converte v in 0/1 robustamente (accetta bool, str, int)."""
+DEFAULTS = {
+    "stress": 0,                 # 0/1
+    "max_dx": 0.15,              # m  (consigliato su Render)
+    "max_dy": 0.15,              # m
+    "target_mm": 15.0,           # mm
+    "dU": 0.0005,                # m (0.5 mm/step)
+    "max_steps": 80,             # per caso
+    "Ptot": 100e3,               # N
+    "testTol": 1.0e-4,
+    "testIter": 15,
+    "algo": "Newton",            # Newton / NewtonLineSearch (se vuoi estendere)
+    "system": "BandGeneral",     # BandGeneral di solito ok
+    "numberer": "RCM",
+    "constraints": "Plain",
+    "n_bins_x": 4,               # stress grid
+    "n_bins_y": 12,
+    "verbose": 0,                # 0/1
+}
+
+# clamp ragionevoli (per evitare richieste assurde)
+CLAMPS = {
+    "max_dx": (0.05, 0.50),
+    "max_dy": (0.05, 0.50),
+    "dU": (0.0001, 0.0020),      # 0.1mm .. 2mm per step
+    "max_steps": (10, 400),
+    "target_mm": (2.0, 60.0),
+    "Ptot": (1e3, 1e7),
+    "testTol": (1e-8, 1e-2),
+    "testIter": (5, 80),
+    "n_bins_x": (2, 12),
+    "n_bins_y": (4, 40),
+}
+
+
+# ============================================================
+#  PARSING ROBUSTO (body + query)
+# ============================================================
+
+def _as_int(v: Any, default: int) -> int:
     if v is None:
         return int(default)
     if isinstance(v, bool):
         return 1 if v else 0
     try:
-        return 1 if int(v) == 1 else 0
+        return int(v)
     except Exception:
         return int(default)
 
 def _as_float(v: Any, default: float) -> float:
+    if v is None:
+        return float(default)
     try:
         return float(v)
     except Exception:
         return float(default)
+
+def _clamp(name: str, val: Union[int, float]) -> Union[int, float]:
+    if name not in CLAMPS:
+        return val
+    lo, hi = CLAMPS[name]
+    if isinstance(val, int):
+        return int(max(lo, min(val, hi)))
+    return float(max(lo, min(val, hi)))
+
+def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Regola: query vince su body.
+    Se un parametro non è presente, usa default.
+    """
+    out = dict(DEFAULTS)
+
+    # body
+    for k in list(DEFAULTS.keys()):
+        if k in payload:
+            out[k] = payload[k]
+
+    # query (vince)
+    for k in list(DEFAULTS.keys()):
+        if k in query and query[k] is not None:
+            out[k] = query[k]
+
+    # cast + clamp
+    out["stress"] = _clamp("stress", 1 if _as_int(out["stress"], DEFAULTS["stress"]) == 1 else 0)
+    out["verbose"] = 1 if _as_int(out.get("verbose", 0), 0) == 1 else 0
+
+    out["max_dx"] = _clamp("max_dx", _as_float(out["max_dx"], DEFAULTS["max_dx"]))
+    out["max_dy"] = _clamp("max_dy", _as_float(out["max_dy"], DEFAULTS["max_dy"]))
+    out["dU"] = _clamp("dU", _as_float(out["dU"], DEFAULTS["dU"]))
+    out["target_mm"] = _clamp("target_mm", _as_float(out["target_mm"], DEFAULTS["target_mm"]))
+    out["Ptot"] = _clamp("Ptot", _as_float(out["Ptot"], DEFAULTS["Ptot"]))
+
+    out["max_steps"] = _clamp("max_steps", _as_int(out["max_steps"], DEFAULTS["max_steps"]))
+    out["testTol"] = _clamp("testTol", _as_float(out["testTol"], DEFAULTS["testTol"]))
+    out["testIter"] = _clamp("testIter", _as_int(out["testIter"], DEFAULTS["testIter"]))
+
+    out["n_bins_x"] = _clamp("n_bins_x", _as_int(out["n_bins_x"], DEFAULTS["n_bins_x"]))
+    out["n_bins_y"] = _clamp("n_bins_y", _as_int(out["n_bins_y"], DEFAULTS["n_bins_y"]))
+
+    out["algo"] = str(out.get("algo", DEFAULTS["algo"]))
+    out["system"] = str(out.get("system", DEFAULTS["system"]))
+    out["numberer"] = str(out.get("numberer", DEFAULTS["numberer"]))
+    out["constraints"] = str(out.get("constraints", DEFAULTS["constraints"]))
+
+    return out
 
 
 # ============================================================
 #  GEOMETRIA / VALIDAZIONE
 # ============================================================
 
-def inside_opening(x: float, y: float,
-                   openings: List[Tuple[float, float, float, float]]) -> bool:
-    """True se il punto (x,y) è dentro una delle aperture (solo interno, NON il bordo)."""
+def inside_opening(x: float, y: float, openings: List[Tuple[float, float, float, float]]) -> bool:
     for (x1, x2, y1, y2) in openings:
         if (x > x1) and (x < x2) and (y > y1) and (y < y2):
             return True
     return False
 
-
-def openings_valid(openings, cordoli_y, margin) -> bool:
-    """
-    Controlla:
-      - aperture dentro parete con margin
-      - distanza da cordoli >= margin
-      - niente sovrapposizioni / troppo vicine
-      - maschi orizzontali >= PIER_MIN quando overlap in y
-      - maschi ai bordi >= PIER_MIN
-    """
-    # 1) limiti parete + maschi ai bordi
+def openings_valid(openings: List[Tuple[float, float, float, float]]) -> bool:
     for (x1, x2, y1, y2) in openings:
+        # maschi ai bordi
         if x1 < PIER_MIN or x2 > (L - PIER_MIN):
             return False
 
-        if not (0.0 + margin <= x1 < x2 <= L - margin):
+        # dentro parete con margin
+        if not (0.0 + MARGIN <= x1 < x2 <= L - MARGIN):
             return False
-        if not (0.0 + margin <= y1 < y2 <= H - margin):
+        if not (0.0 + MARGIN <= y1 < y2 <= H - MARGIN):
             return False
 
-        # 2) distanza da cordoli
-        for (yc1, yc2) in cordoli_y:
-            if not (y2 <= yc1 - margin or y1 >= yc2 + margin):
+        # distanza da cordoli
+        for (yc1, yc2) in CORDOLI_Y:
+            if not (y2 <= yc1 - MARGIN or y1 >= yc2 + MARGIN):
                 return False
 
-    # 3) distanze tra aperture / maschi
     n = len(openings)
     for i in range(n):
         x1i, x2i, y1i, y2i = openings[i]
@@ -103,19 +175,17 @@ def openings_valid(openings, cordoli_y, margin) -> bool:
 
             overlap_y = not (y2i <= y1j or y2j <= y1i)
 
-            # stessi piani => maschio orizzontale >= PIER_MIN
             if overlap_y and dx_gap < PIER_MIN:
                 return False
 
-            # “diagonali” => separazione minima generica
-            if dx_gap < margin and dy_gap < margin:
+            if dx_gap < MARGIN and dy_gap < MARGIN:
                 return False
 
     return True
 
 
 # ============================================================
-#  MESH CONFORME (COME NEL NOTEBOOK)
+#  MESH CONFORME
 # ============================================================
 
 def _unique_sorted(vals: List[float], tol: float = 1e-6) -> List[float]:
@@ -126,9 +196,7 @@ def _unique_sorted(vals: List[float], tol: float = 1e-6) -> List[float]:
             out.append(v)
     return out
 
-
 def _refine_intervals(coords: List[float], max_step: float) -> List[float]:
-    """Spezza ogni intervallo in sotto-intervalli <= max_step."""
     refined = [coords[0]]
     for a, b in zip(coords[:-1], coords[1:]):
         seg = b - a
@@ -140,18 +208,8 @@ def _refine_intervals(coords: List[float], max_step: float) -> List[float]:
                 refined.append(a + seg * k / n)
     return _unique_sorted(refined)
 
-
 def build_conforming_grid(openings: List[Tuple[float, float, float, float]],
-                          max_dx: float,
-                          max_dy: float) -> Tuple[List[float], List[float]]:
-    """
-    Costruisce una griglia che *allinea* nodi a:
-      - bordi parete (0, L) e (0, H)
-      - margini (MARGIN, L-MARGIN, ecc.)
-      - bordi cordoli (y1c, y2c)
-      - bordi aperture (x1,x2,y1,y2)
-    Poi raffina gli intervalli con max_dx/max_dy.
-    """
+                          max_dx: float, max_dy: float) -> Tuple[List[float], List[float]]:
     xs = [0.0, L, MARGIN, L - MARGIN]
     ys = [0.0, H, MARGIN, H - MARGIN]
 
@@ -172,7 +230,7 @@ def build_conforming_grid(openings: List[Tuple[float, float, float, float]],
 
 
 # ============================================================
-#  MATERIALI J2 (come nel tuo setup)
+#  MATERIALI J2
 # ============================================================
 
 def K_from_E_nu(E: float, nu: float) -> float:
@@ -183,25 +241,17 @@ def G_from_E_nu(E: float, nu: float) -> float:
 
 
 # ============================================================
-#  MODELLO NL: build + pushover
+#  BUILD MODEL + PUSHOVER
 # ============================================================
 
 def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
-                             max_dx: float,
-                             max_dy: float) -> Tuple[Dict[Tuple[int, int], int], int, List[float], List[float]]:
-    """
-    Modello NL J2 con mesh conforme.
-    Ritorna:
-      node_tags, control_node, xs, ys
-    """
+                             max_dx: float, max_dy: float,
+                             Ptot: float) -> Tuple[Dict[Tuple[int, int], int], int, List[float], List[float]]:
     ops.wipe()
-    ops.model('basic', '-ndm', 2, '-ndf', 2)
+    ops.model("basic", "-ndm", 2, "-ndf", 2)
 
     xs, ys = build_conforming_grid(openings, max_dx=max_dx, max_dy=max_dy)
 
-    # -------------------------
-    # NODI (no dentro aperture)
-    # -------------------------
     node_tags: Dict[Tuple[int, int], int] = {}
     tag = 1
     for j, y in enumerate(ys):
@@ -212,20 +262,16 @@ def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
             node_tags[(i, j)] = tag
             tag += 1
 
-    # Vincoli base
+    # base fix
     for i in range(len(xs)):
         key = (i, 0)
         if key in node_tags:
             ops.fix(node_tags[key], 1, 1)
 
-    # -------------------------
-    # MATERIALI
-    # -------------------------
-    # Muratura
+    # materiali (come tuo setup)
     E_mur, nu_mur = 1.5e9, 0.15
     sig0_m, sigInf_m, delta_m, H_m = 0.5e6, 2.0e6, 8.0, 0.0
 
-    # Cordoli (c.a.)
     E_cord, nu_cord = 30e9, 0.20
     sig0_c, sigInf_c, delta_c, H_c = 6.0e6, 25.0e6, 6.0, 0.0
 
@@ -233,18 +279,16 @@ def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
     K_c, G_c = K_from_E_nu(E_cord, nu_cord), G_from_E_nu(E_cord, nu_cord)
 
     matTag_mur_3D, matTag_cord_3D = 10, 20
-    ops.nDMaterial('J2Plasticity', matTag_mur_3D,  K_m, G_m, sig0_m, sigInf_m, delta_m, H_m)
-    ops.nDMaterial('J2Plasticity', matTag_cord_3D, K_c, G_c, sig0_c, sigInf_c, delta_c, H_c)
+    ops.nDMaterial("J2Plasticity", matTag_mur_3D,  K_m, G_m, sig0_m, sigInf_m, delta_m, H_m)
+    ops.nDMaterial("J2Plasticity", matTag_cord_3D, K_c, G_c, sig0_c, sigInf_c, delta_c, H_c)
 
     matTag_mur, matTag_cord = 1, 2
-    ops.nDMaterial('PlaneStress', matTag_mur,  matTag_mur_3D)
-    ops.nDMaterial('PlaneStress', matTag_cord, matTag_cord_3D)
+    ops.nDMaterial("PlaneStress", matTag_mur,  matTag_mur_3D)
+    ops.nDMaterial("PlaneStress", matTag_cord, matTag_cord_3D)
 
-    t = 0.25  # spessore
+    t = 0.25
 
-    # -------------------------
-    # ELEMENTI QUAD
-    # -------------------------
+    # elementi quad
     eleTag = 1
     for j in range(len(ys) - 1):
         y_low, y_up = ys[j], ys[j + 1]
@@ -260,18 +304,14 @@ def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
             keys = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
             if not all(k in node_tags for k in keys):
                 continue
-
             n1 = node_tags[keys[0]]
             n2 = node_tags[keys[1]]
             n3 = node_tags[keys[2]]
             n4 = node_tags[keys[3]]
-
-            ops.element('quad', eleTag, n1, n2, n3, n4, t, 'PlaneStress', this_mat, 0.0, 0.0, 0.0)
+            ops.element("quad", eleTag, n1, n2, n3, n4, t, "PlaneStress", this_mat, 0.0, 0.0, 0.0)
             eleTag += 1
 
-    # -------------------------
-    # CARICO IN SOMMITÀ
-    # -------------------------
+    # carico in sommità
     j_top = len(ys) - 1
     top_nodes = [node_tags[(i, j_top)] for i in range(len(xs)) if (i, j_top) in node_tags]
     if not top_nodes:
@@ -279,20 +319,17 @@ def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
 
     control_node = top_nodes[len(top_nodes) // 2]
 
-    ops.timeSeries('Linear', 1)
-    ops.pattern('Plain', 1, 1)
+    ops.timeSeries("Linear", 1)
+    ops.pattern("Plain", 1, 1)
 
-    Ptot = 100e3
-    Pnode = Ptot / len(top_nodes)
+    Pnode = float(Ptot) / len(top_nodes)
     for nd in top_nodes:
         ops.load(nd, Pnode, 0.0)
 
     return node_tags, control_node, xs, ys
 
 
-def shear_at_target_disp(disp_mm: np.ndarray,
-                         shear_kN: np.ndarray,
-                         target_mm: float = TARGET_DISP_MM) -> Optional[float]:
+def shear_at_target_disp(disp_mm: np.ndarray, shear_kN: np.ndarray, target_mm: float) -> Optional[float]:
     if len(disp_mm) < 2:
         return None
     if float(np.max(disp_mm)) < target_mm:
@@ -300,20 +337,7 @@ def shear_at_target_disp(disp_mm: np.ndarray,
     return float(np.interp(target_mm, disp_mm, shear_kN))
 
 
-# ============================================================
-#  LETTURA TENSIONI (TAU / SIGMA)
-# ============================================================
-
-def _compute_stress_grid_profiles(
-    n_bins_x: int = 4,
-    n_bins_y: int = 12
-) -> Dict[str, Any]:
-    """
-    Legge tensioni (stress) dagli elementi quad (stato finale).
-    Costruisce:
-      - profilo verticale medio di tau e sigma_c
-      - zone 2D (x_range, y_range) con tau/sigma.
-    """
+def _compute_stress_grid_profiles(n_bins_x: int, n_bins_y: int) -> Dict[str, Any]:
     ele_tags = ops.getEleTags()
     if not ele_tags:
         return {
@@ -337,32 +361,31 @@ def _compute_stress_grid_profiles(
     sigc_max_2d = np.full((n_bins_x, n_bins_y), -1e20)
 
     for ele in ele_tags:
-        stress = ops.eleResponse(ele, 'stress')
+        stress = ops.eleResponse(ele, "stress")
         if stress is None:
             continue
 
-        tau_vals  = []
+        tau_vals = []
         sigy_vals = []
 
-        # quad: stress viene spesso a blocchi di 3 (sigx, sigy, tau)
-        for i in range(0, len(stress), 3):
-            sigx = stress[i]
-            sigy = stress[i+1]
-            tau  = stress[i+2]
-            tau_vals.append(abs(float(tau)))
-            sigy_vals.append(float(sigy))
+        for k in range(0, len(stress), 3):
+            sigy = float(stress[k + 1])
+            tau  = float(stress[k + 2])
+            tau_vals.append(abs(tau))
+            sigy_vals.append(sigy)
 
         if not tau_vals or not sigy_vals:
             continue
 
-        tau_max_el  = max(tau_vals)
+        tau_max_el = max(tau_vals)
         tau_mean_el = sum(tau_vals) / len(tau_vals)
 
-        sigy_min = min(sigy_vals)         # più compressiva (negativa)
+        sigy_min = min(sigy_vals)
         sigma_c_el = abs(sigy_min)
 
         nds = ops.eleNodes(ele)
-        xs, ys = [], []
+        xs = []
+        ys = []
         for nd in nds:
             x_nd, y_nd = ops.nodeCoord(nd)
             xs.append(float(x_nd))
@@ -377,10 +400,9 @@ def _compute_stress_grid_profiles(
         if j < 0 or j >= n_bins_y:
             continue
 
-        tau_sum_y[j]   += tau_mean_el
+        tau_sum_y[j] += tau_mean_el
         tau_count_y[j] += 1
-
-        sigc_sum_y[j]   += sigma_c_el
+        sigc_sum_y[j] += sigma_c_el
         sigc_count_y[j] += 1
 
         i = int(np.searchsorted(x_edges, xc) - 1)
@@ -390,10 +412,8 @@ def _compute_stress_grid_profiles(
         tau_max_2d[i, j] = max(tau_max_2d[i, j], tau_max_el)
         tau_sum_2d[i, j] += tau_mean_el
         tau_count_2d[i, j] += 1
-
         sigc_max_2d[i, j] = max(sigc_max_2d[i, j], sigma_c_el)
 
-    # profili 1D
     y_out, tau_mean_y = [], []
     for j in range(n_bins_y):
         if tau_count_y[j] > 0:
@@ -406,27 +426,18 @@ def _compute_stress_grid_profiles(
             y_sig_out.append(float(y_centers[j]))
             sigc_mean_y.append(float(sigc_sum_y[j] / sigc_count_y[j]))
 
-    # griglia 2D zone
     zones = []
     for i in range(n_bins_x):
         for j in range(n_bins_y):
             if tau_count_2d[i, j] <= 0:
                 continue
-
-            x_min, x_max = float(x_edges[i]), float(x_edges[i+1])
-            y_min, y_max = float(y_edges[j]), float(y_edges[j+1])
-
-            tau_mean_zone = float(tau_sum_2d[i, j] / tau_count_2d[i, j])
-            tau_max_zone  = float(tau_max_2d[i, j]) if tau_max_2d[i, j] > -1e10 else 0.0
-            sigma_c_zone  = float(sigc_max_2d[i, j]) if sigc_max_2d[i, j] > -1e10 else 0.0
-
             zones.append({
                 "id": f"z_{i}_{j}",
-                "x_range": [x_min, x_max],
-                "y_range": [y_min, y_max],
-                "tau_max": tau_max_zone,
-                "tau_mean": tau_mean_zone,
-                "sigma_c_max": sigma_c_zone
+                "x_range": [float(x_edges[i]), float(x_edges[i+1])],
+                "y_range": [float(y_edges[j]), float(y_edges[j+1])],
+                "tau_max": float(tau_max_2d[i, j]) if tau_max_2d[i, j] > -1e10 else 0.0,
+                "tau_mean": float(tau_sum_2d[i, j] / tau_count_2d[i, j]),
+                "sigma_c_max": float(sigc_max_2d[i, j]) if sigc_max_2d[i, j] > -1e10 else 0.0,
             })
 
     return {
@@ -436,195 +447,168 @@ def _compute_stress_grid_profiles(
     }
 
 
-# ============================================================
-#  ANALISI PUSHOVER
-# ============================================================
+def run_pushover_case(openings: List[Tuple[float, float, float, float]], params: Dict[str, Any]) -> Dict[str, Any]:
+    t0 = time.time()
 
-def run_pushover_nonlinear_conforming(openings: List[Tuple[float, float, float, float]],
-                                      max_dx: float,
-                                      max_dy: float,
-                                      target_mm: float = TARGET_DISP_MM,
-                                      max_steps: int = 140,
-                                      dU: float = 0.0002,
-                                      verbose: bool = False,
-                                      compute_stress_profiles: bool = False) -> Dict[str, Any]:
-    """
-    Pushover NL su mesh conforme.
-    """
-    try:
-        if not openings_valid(openings, CORDOLI_Y, MARGIN):
-            base = {
-                "status": "error",
-                "message": "openings_invalid",
-                "disp_mm": [],
-                "shear_kN": [],
-                "V_target": None,
-                "mesh": {"max_dx": float(max_dx), "max_dy": float(max_dy)},
-            }
-            if compute_stress_profiles:
-                base["stress_profiles"] = {
-                    "tau_profile_y": {"y": [], "tau_mean": []},
-                    "sigma_profile_y": {"y": [], "sigma_c_mean": []},
-                    "zones": []
-                }
-            return base
-
-        node_tags, control_node, xs, ys = build_wall_J2_conforming(openings, max_dx=max_dx, max_dy=max_dy)
-
-        ops.constraints('Plain')
-        ops.numberer('RCM')
-        ops.system('BandGeneral')
-        ops.test('NormUnbalance', 1.0e-4, 15)
-        ops.algorithm('Newton')
-        ops.integrator('DisplacementControl', control_node, 1, dU)
-        ops.analysis('Static')
-
-        disp_mm: List[float] = []
-        shear_kN: List[float] = []
-
-        buf = io.StringIO()
-
-        for step in range(max_steps):
-            buf.truncate(0)
-            buf.seek(0)
-
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                ok = ops.analyze(1)
-
-            log_text = buf.getvalue()
-
-            if ok < 0:
-                if verbose:
-                    print(f"[NL] analyze failed step={step}\n{log_text.strip()}")
-                break
-
-            u = ops.nodeDisp(control_node, 1)  # m
-            ops.reactions()
-
-            Vb = 0.0
-            for (i, j), nd in node_tags.items():
-                if j == 0:
-                    Vb += ops.nodeReaction(nd, 1)
-
-            disp_mm.append(float(u * 1000.0))
-            shear_kN.append(float(-Vb / 1000.0))
-
-            if disp_mm[-1] >= target_mm * 1.0:
-                break
-
-        disp_arr = np.array(disp_mm, dtype=float)
-        shear_arr = np.array(shear_kN, dtype=float)
-
-        V_target = shear_at_target_disp(disp_arr, shear_arr, target_mm)
-
-        result: Dict[str, Any] = {
-            "status": "ok" if V_target is not None else "error",
-            "message": None if V_target is not None else "analysis_not_reached_target",
-            "disp_mm": disp_arr.tolist(),
-            "shear_kN": shear_arr.tolist(),
-            "V_target": V_target,
-            "mesh": {
-                "max_dx": float(max_dx),
-                "max_dy": float(max_dy),
-                "n_x_lines": int(len(xs)),
-                "n_y_lines": int(len(ys)),
-                "approx_nodes": int(ops.getNumNodes()) if hasattr(ops, "getNumNodes") else None,  # safe
-                "approx_eles": int(ops.getNumElems()) if hasattr(ops, "getNumElems") else None,   # safe
-            }
-        }
-
-        if compute_stress_profiles:
-            result["stress_profiles"] = _compute_stress_grid_profiles(n_bins_x=4, n_bins_y=12)
-
-        return result
-
-    except Exception as e:
-        if verbose:
-            print(f"[run_pushover_nonlinear_conforming] errore: {e}")
-        base = {
+    if not openings_valid(openings):
+        return {
             "status": "error",
-            "message": str(e),
+            "message": "openings_invalid",
             "disp_mm": [],
             "shear_kN": [],
             "V_target": None,
-            "mesh": {"max_dx": float(max_dx), "max_dy": float(max_dy)},
         }
-        if compute_stress_profiles:
-            base["stress_profiles"] = {
-                "tau_profile_y": {"y": [], "tau_mean": []},
-                "sigma_profile_y": {"y": [], "sigma_c_mean": []},
-                "zones": []
-            }
-        return base
+
+    # build
+    node_tags, control_node, xs, ys = build_wall_J2_conforming(
+        openings,
+        max_dx=float(params["max_dx"]),
+        max_dy=float(params["max_dy"]),
+        Ptot=float(params["Ptot"]),
+    )
+
+    # analysis setup
+    ops.constraints(str(params["constraints"]))
+    ops.numberer(str(params["numberer"]))
+    ops.system(str(params["system"]))
+
+    ops.test("NormUnbalance", float(params["testTol"]), int(params["testIter"]))
+
+    algo = str(params["algo"])
+    if algo == "Newton":
+        ops.algorithm("Newton")
+    else:
+        # fallback
+        ops.algorithm("Newton")
+
+    ops.integrator("DisplacementControl", int(control_node), 1, float(params["dU"]))
+    ops.analysis("Static")
+
+    disp_mm: List[float] = []
+    shear_kN: List[float] = []
+    buf = io.StringIO()
+
+    for step in range(int(params["max_steps"])):
+        buf.truncate(0)
+        buf.seek(0)
+
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            ok = ops.analyze(1)
+
+        if ok < 0:
+            if params["verbose"] == 1:
+                log_text = buf.getvalue().strip()
+                return {
+                    "status": "error",
+                    "message": f"analysis_failed_step_{step}",
+                    "disp_mm": disp_mm,
+                    "shear_kN": shear_kN,
+                    "V_target": None,
+                    "debug": log_text[:800],
+                }
+            break
+
+        u = float(ops.nodeDisp(control_node, 1))  # m
+        ops.reactions()
+
+        Vb = 0.0
+        for (i, j), nd in node_tags.items():
+            if j == 0:
+                Vb += float(ops.nodeReaction(nd, 1))
+
+        disp_mm.append(u * 1000.0)
+        shear_kN.append(-Vb / 1000.0)
+
+        if disp_mm[-1] >= float(params["target_mm"]):
+            break
+
+    disp_arr = np.array(disp_mm, dtype=float)
+    shear_arr = np.array(shear_kN, dtype=float)
+
+    Vt = shear_at_target_disp(disp_arr, shear_arr, float(params["target_mm"]))
+
+    out: Dict[str, Any] = {
+        "status": "ok" if Vt is not None else "error",
+        "message": None if Vt is not None else "analysis_not_reached_target",
+        "disp_mm": disp_arr.tolist(),
+        "shear_kN": shear_arr.tolist(),
+        "V_target": Vt,
+        "mesh": {
+            "max_dx": float(params["max_dx"]),
+            "max_dy": float(params["max_dy"]),
+            "n_x_lines": int(len(xs)),
+            "n_y_lines": int(len(ys)),
+            "n_nodes": int(ops.getNumNodes()) if hasattr(ops, "getNumNodes") else None,
+            "n_eles": int(ops.getNumElems()) if hasattr(ops, "getNumElems") else None,
+        },
+        "timing_s": {
+            "total": float(time.time() - t0),
+        }
+    }
+
+    if int(params["stress"]) == 1:
+        out["stress_profiles"] = _compute_stress_grid_profiles(
+            int(params["n_bins_x"]),
+            int(params["n_bins_y"])
+        )
+
+    return out
 
 
-# ============================================================
-#  RUN DUE CASI (existing + project)
-# ============================================================
-
-def run_two_cases_from_dict(data: Dict[str, Any],
-                            compute_profiles: bool,
-                            max_dx: float,
-                            max_dy: float) -> Dict[str, Any]:
-    existing_openings = [tuple(o) for o in data.get("existing_openings", [])]
-    project_openings  = [tuple(o) for o in data.get("project_openings", [])]
+def run_two_cases(payload: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+    existing_openings = [tuple(o) for o in payload.get("existing_openings", [])]
+    project_openings  = [tuple(o) for o in payload.get("project_openings", [])]
 
     if not existing_openings:
         raise ValueError("Chiave 'existing_openings' mancante o vuota.")
     if not project_openings:
         raise ValueError("Chiave 'project_openings' mancante o vuota.")
 
-    res_existing = run_pushover_nonlinear_conforming(
-        existing_openings,
-        max_dx=max_dx,
-        max_dy=max_dy,
-        compute_stress_profiles=compute_profiles
-    )
-    res_project = run_pushover_nonlinear_conforming(
-        project_openings,
-        max_dx=max_dx,
-        max_dy=max_dy,
-        compute_stress_profiles=compute_profiles
-    )
+    res_existing = run_pushover_case(existing_openings, params)
+    res_project  = run_pushover_case(project_openings, params)
 
     return {"existing": res_existing, "project": res_project}
 
 
 # ============================================================
-#  FASTAPI APP
+#  FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="Wall Pushover Service (Conforming Mesh)",
-    description="Pushover muratura (Existing + Project) con mesh conforme alle aperture e stress opzionali",
-    version="2.0.0"
+    version="3.0.0",
+    description="Pushover muratura (Existing + Project) con mesh conforme e parametri controllabili da body/query."
 )
 
-
 @app.get("/")
-def read_root():
-    return {"status": "ok", "message": "Wall Pushover Service attivo (conforming mesh)"}
+def root():
+    return {"status": "ok", "service": "pushover-conforming", "defaults": DEFAULTS}
 
 
 @app.post("/pushover")
-async def pushover_endpoint(
+async def pushover(
     request: Request,
-    max_dx: float = MAX_DX_DEFAULT,   # query override (opzionale)
-    max_dy: float = MAX_DY_DEFAULT    # query override (opzionale)
+    # query params (tutti opzionali) — vincono sul body
+    stress: Optional[int] = None,
+    max_dx: Optional[float] = None,
+    max_dy: Optional[float] = None,
+    dU: Optional[float] = None,
+    max_steps: Optional[int] = None,
+    target_mm: Optional[float] = None,
+    Ptot: Optional[float] = None,
+    testTol: Optional[float] = None,
+    testIter: Optional[int] = None,
+    algo: Optional[str] = None,
+    system: Optional[str] = None,
+    numberer: Optional[str] = None,
+    constraints: Optional[str] = None,
+    n_bins_x: Optional[int] = None,
+    n_bins_y: Optional[int] = None,
+    verbose: Optional[int] = None,
 ):
-    """
-    Body JSON:
-      - { "existing_openings": [...], "project_openings": [...], "stress": 0/1, "max_dx": ..., "max_dy": ... }
-        oppure
-      - [{ ... }] (wrapper n8n/lovable)
-
-    Regole:
-      - stress lo leggo dal BODY (0/1)
-      - max_dx/max_dy: puoi metterli nel body, ma se li passi in query vincono quelli in query
-    """
     payload = await request.json()
 
-    # wrapper n8n: lista con 1 elemento
+    # wrapper n8n/lovable: lista con 1 elemento
     if isinstance(payload, list):
         if not payload:
             return JSONResponse(status_code=400, content={"error": "Payload list vuota."})
@@ -633,28 +617,36 @@ async def pushover_endpoint(
     if not isinstance(payload, dict):
         return JSONResponse(status_code=400, content={"error": "Payload non valido: atteso oggetto JSON."})
 
-    # stress: SOLO da body (come richiesto)
-    compute_profiles = (_as_int01(payload.get("stress", 0), default=0) == 1)
+    query = {
+        "stress": stress,
+        "max_dx": max_dx,
+        "max_dy": max_dy,
+        "dU": dU,
+        "max_steps": max_steps,
+        "target_mm": target_mm,
+        "Ptot": Ptot,
+        "testTol": testTol,
+        "testIter": testIter,
+        "algo": algo,
+        "system": system,
+        "numberer": numberer,
+        "constraints": constraints,
+        "n_bins_x": n_bins_x,
+        "n_bins_y": n_bins_y,
+        "verbose": verbose,
+    }
 
-    # max_dx/max_dy: body override se vuoi, ma query vince
-    body_max_dx = _as_float(payload.get("max_dx", MAX_DX_DEFAULT), default=MAX_DX_DEFAULT)
-    body_max_dy = _as_float(payload.get("max_dy", MAX_DY_DEFAULT), default=MAX_DY_DEFAULT)
+    params = _merge_params(payload, query)
 
-    # se l’utente non passa query, FastAPI usa default => in quel caso prendiamo dal body
-    # (per distinguere: consideriamo "query passed" se diverso da default oppure se nel body non c'è)
-    # più semplice: se nel body c'è esplicitamente max_dx/max_dy, usali al posto dei default query.
-    # ma se l’utente mette max_dx in query, lo lasciamo com’è.
-    if "max_dx" in payload and float(max_dx) == float(MAX_DX_DEFAULT):
-        max_dx = body_max_dx
-    if "max_dy" in payload and float(max_dy) == float(MAX_DY_DEFAULT):
-        max_dy = body_max_dy
-
-    # clamp “ragionevole” (evita mesh assurde)
-    max_dx = float(max(0.05, min(max_dx, 0.50)))
-    max_dy = float(max(0.05, min(max_dy, 0.50)))
-
+    t0 = time.time()
     try:
-        result = run_two_cases_from_dict(payload, compute_profiles, max_dx, max_dy)
-        return JSONResponse(content=result)
+        result = run_two_cases(payload, params)
+        return JSONResponse(content={
+            "meta": {
+                "params_used": params,
+                "timing_s": {"total": float(time.time() - t0)}
+            },
+            "results": result
+        })
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(status_code=400, content={"error": str(e), "params_used": params})
