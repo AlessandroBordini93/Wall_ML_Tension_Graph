@@ -294,7 +294,6 @@ def build_wall_J2_conforming(
     for nd in top_nodes:
         ops.load(nd, Pnode, 0.0)
 
-    # conteggi "safe"
     n_nodes = len(node_tags)
     n_eles = eleTag - 1
 
@@ -314,7 +313,9 @@ def build_wall_J2_conforming(
 def _compute_stress_grid_profiles(n_bins_x: int, n_bins_y: int) -> Dict[str, Any]:
     ele_tags = ops.getEleTags()
     if not ele_tags:
-        return {"tau_profile_y": {"y": [], "tau_mean": []}, "sigma_profile_y": {"y": [], "sigma_c_mean": []}, "zones": []}
+        return {"tau_profile_y": {"y": [], "tau_mean": []},
+                "sigma_profile_y": {"y": [], "sigma_c_mean": []},
+                "zones": []}
 
     y_edges = np.linspace(0.0, H, n_bins_y + 1)
     y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
@@ -385,19 +386,43 @@ def run_pushover_case(openings: List[Tuple[float, float, float, float]], params:
     t0 = time.time()
 
     if not openings_valid(openings):
-        return {"status": "error", "message": "openings_invalid", "disp_mm": [], "shear_kN": [], "V_target": None}
+        return {
+            "status": "error",
+            "message": "openings_invalid",
+            "disp_mm": [],
+            "shear_kN": [],
+            "V_target": None,
+            "timing_s": {"total": float(time.time() - t0)},
+        }
 
-    # build
+    verbose = int(params.get("verbose", 0)) == 1
+    buf = io.StringIO() if verbose else None
+
+    # ---- BUILD MODEL ----
+    t_build0 = time.time()
     model = build_wall_J2_conforming(
         openings=openings,
         max_dx=float(params["max_dx"]),
         max_dy=float(params["max_dy"]),
         Ptot=float(params["Ptot"]),
     )
+    t_build = time.time() - t_build0
+
     node_tags = model["node_tags"]
     control_node = model["control_node"]
+    base_nodes = [nd for (i, j), nd in node_tags.items() if j == 0]
 
-    # analysis setup
+    mesh_info = {
+        "max_dx": float(params["max_dx"]),
+        "max_dy": float(params["max_dy"]),
+        "n_x_lines": len(model["xs"]),
+        "n_y_lines": len(model["ys"]),
+        "n_nodes": model["n_nodes"],
+        "n_eles": model["n_eles"],
+    }
+
+    # ---- ANALYSIS SETUP ----
+    t_setup0 = time.time()
     ops.constraints(str(params["constraints"]))
     ops.numberer(str(params["numberer"]))
     ops.system(str(params["system"]))
@@ -411,16 +436,16 @@ def run_pushover_case(openings: List[Tuple[float, float, float, float]], params:
 
     ops.integrator("DisplacementControl", int(control_node), 1, float(params["dU"]))
     ops.analysis("Static")
+    t_setup = time.time() - t_setup0
+
+    # ---- ANALYZE LOOP ----
+    max_steps = int(params["max_steps"])
+    target_mm = float(params["target_mm"])
 
     disp_mm: List[float] = []
     shear_kN: List[float] = []
 
-    verbose = int(params["verbose"]) == 1
-    buf = io.StringIO() if verbose else None
-
-    max_steps = int(params["max_steps"])
-    target_mm = float(params["target_mm"])
-
+    t_loop0 = time.time()
     for step in range(max_steps):
         if verbose:
             buf.truncate(0); buf.seek(0)
@@ -437,62 +462,13 @@ def run_pushover_case(openings: List[Tuple[float, float, float, float]], params:
                 "shear_kN": shear_kN,
                 "V_target": None,
                 "debug": (buf.getvalue().strip()[:800] if verbose else None),
-                "mesh": {
-                    "max_dx": float(params["max_dx"]),
-                    "max_dy": float(params["max_dy"]),
-                    "n_x_lines": len(model["xs"]),
-                    "n_y_lines": len(model["ys"]),
-                    "n_nodes": model["n_nodes"],
-                    "n_eles": model["n_eles"],
+                "mesh": mesh_info,
+                "timing_s": {
+                    "build": float(t_build),
+                    "setup": float(t_setup),
+                    "loop": float(time.time() - t_loop0),
+                    "total": float(time.time() - t0),
                 },
-                "timing_s": {"total": float(time.time() - t0)},
-            }
-
-        u = float(ops.nodeDisp(control_node, 1))  # m
-        ops.reactions()
-
-        Vb = 0.0
-        for (_ij, nd) in node_tags.items():
-            # base nodes = j == 0
-            # (salviamo j nell'indice del dict)
-            pass
-
-        # più veloce: scorri solo i base nodes precomputati
-        # (precomputo la prima volta)
-        break
-
-    # ---- RILANCIO con base nodes precomputati (ottimizzazione reale) ----
-    base_nodes = [nd for (i, j), nd in node_tags.items() if j == 0]
-
-    disp_mm = []
-    shear_kN = []
-    # reset analysis state: più semplice rifare solo loop; modello è già in memoria, quindi ok
-    # (non rebuildiamo)
-    for step in range(max_steps):
-        if verbose:
-            buf.truncate(0); buf.seek(0)
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                ok = ops.analyze(1)
-        else:
-            ok = ops.analyze(1)
-
-        if ok < 0:
-            return {
-                "status": "error",
-                "message": f"analysis_failed_step_{step}",
-                "disp_mm": disp_mm,
-                "shear_kN": shear_kN,
-                "V_target": None,
-                "debug": (buf.getvalue().strip()[:800] if verbose else None),
-                "mesh": {
-                    "max_dx": float(params["max_dx"]),
-                    "max_dy": float(params["max_dy"]),
-                    "n_x_lines": len(model["xs"]),
-                    "n_y_lines": len(model["ys"]),
-                    "n_nodes": model["n_nodes"],
-                    "n_eles": model["n_eles"],
-                },
-                "timing_s": {"total": float(time.time() - t0)},
             }
 
         u = float(ops.nodeDisp(control_node, 1))  # m
@@ -508,6 +484,8 @@ def run_pushover_case(openings: List[Tuple[float, float, float, float]], params:
         if disp_mm[-1] >= target_mm:
             break
 
+    t_loop = time.time() - t_loop0
+
     disp_arr = np.array(disp_mm, dtype=float)
     shear_arr = np.array(shear_kN, dtype=float)
     Vt = shear_at_target_disp(disp_arr, shear_arr, target_mm)
@@ -518,19 +496,20 @@ def run_pushover_case(openings: List[Tuple[float, float, float, float]], params:
         "disp_mm": disp_arr.tolist(),
         "shear_kN": shear_arr.tolist(),
         "V_target": Vt,
-        "mesh": {
-            "max_dx": float(params["max_dx"]),
-            "max_dy": float(params["max_dy"]),
-            "n_x_lines": len(model["xs"]),
-            "n_y_lines": len(model["ys"]),
-            "n_nodes": model["n_nodes"],
-            "n_eles": model["n_eles"],
+        "mesh": mesh_info,
+        "timing_s": {
+            "build": float(t_build),
+            "setup": float(t_setup),
+            "loop": float(t_loop),
+            "stress_profiles": 0.0,
+            "total": float(time.time() - t0),
         },
-        "timing_s": {"total": float(time.time() - t0)},
     }
 
     if int(params["stress"]) == 1:
+        t_st0 = time.time()
         out["stress_profiles"] = _compute_stress_grid_profiles(int(params["n_bins_x"]), int(params["n_bins_y"]))
+        out["timing_s"]["stress_profiles"] = float(time.time() - t_st0)
 
     return out
 
@@ -554,8 +533,8 @@ def run_two_cases(payload: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, 
 # ============================================================
 app = FastAPI(
     title="Wall Pushover Service (Conforming Mesh)",
-    version="3.1.0",
-    description="Pushover muratura (Existing + Project) con mesh conforme e parametri via body/query."
+    version="3.2.0",
+    description="Pushover muratura (Existing + Project) con mesh conforme e timing dettagliati."
 )
 
 @app.get("/")
@@ -604,11 +583,14 @@ async def pushover(
 
     params = _merge_params(payload, query)
 
-    t0 = time.time()
+    t_req0 = time.time()
     try:
         result = run_two_cases(payload, params)
         return JSONResponse(content={
-            "meta": {"params_used": params, "timing_s": {"total": float(time.time() - t0)}},
+            "meta": {
+                "params_used": params,
+                "timing_s": {"request_total": float(time.time() - t_req0)}
+            },
             "results": result
         })
     except Exception as e:
