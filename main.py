@@ -7,54 +7,46 @@ from typing import Any, Dict, List, Tuple, Optional, Union
 import numpy as np
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-
 import openseespy.opensees as ops
 
 
 # ============================================================
-#  COSTANTI GEOMETRICHE (fisse)
+#  GEOMETRIA
 # ============================================================
-
 L = 4.0
 H = 6.0
 
-CORDOLI_Y = [
-    (2.7, 3.0),
-    (5.7, 6.0),
-]
-
+CORDOLI_Y = [(2.7, 3.0), (5.7, 6.0)]
 MARGIN = 0.30
 PIER_MIN = 0.30
 
 
 # ============================================================
-#  DEFAULT "PRODUZIONE" (Render-friendly)
+#  DEFAULTS "PRODUZIONE" (Render-friendly)
 # ============================================================
-
 DEFAULTS = {
-    "stress": 0,                 # 0/1
-    "max_dx": 0.15,              # m  (consigliato su Render)
-    "max_dy": 0.15,              # m
-    "target_mm": 15.0,           # mm
-    "dU": 0.0005,                # m (0.5 mm/step)
-    "max_steps": 80,             # per caso
-    "Ptot": 100e3,               # N
+    "stress": 0,
+    "max_dx": 0.15,
+    "max_dy": 0.15,
+    "target_mm": 15.0,
+    "dU": 0.0005,          # 0.5 mm/step
+    "max_steps": 80,
+    "Ptot": 100e3,
     "testTol": 1.0e-4,
     "testIter": 15,
-    "algo": "Newton",            # Newton / NewtonLineSearch (se vuoi estendere)
-    "system": "BandGeneral",     # BandGeneral di solito ok
+    "algo": "Newton",
+    "system": "BandGeneral",
     "numberer": "RCM",
     "constraints": "Plain",
-    "n_bins_x": 4,               # stress grid
+    "n_bins_x": 4,
     "n_bins_y": 12,
-    "verbose": 0,                # 0/1
+    "verbose": 0,
 }
 
-# clamp ragionevoli (per evitare richieste assurde)
 CLAMPS = {
     "max_dx": (0.05, 0.50),
     "max_dy": (0.05, 0.50),
-    "dU": (0.0001, 0.0020),      # 0.1mm .. 2mm per step
+    "dU": (0.0001, 0.0020),
     "max_steps": (10, 400),
     "target_mm": (2.0, 60.0),
     "Ptot": (1e3, 1e7),
@@ -66,9 +58,8 @@ CLAMPS = {
 
 
 # ============================================================
-#  PARSING ROBUSTO (body + query)
+#  PARSING ROBUSTO
 # ============================================================
-
 def _as_int(v: Any, default: int) -> int:
     if v is None:
         return int(default)
@@ -96,24 +87,19 @@ def _clamp(name: str, val: Union[int, float]) -> Union[int, float]:
     return float(max(lo, min(val, hi)))
 
 def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Regola: query vince su body.
-    Se un parametro non è presente, usa default.
-    """
     out = dict(DEFAULTS)
 
     # body
-    for k in list(DEFAULTS.keys()):
+    for k in DEFAULTS:
         if k in payload:
             out[k] = payload[k]
 
-    # query (vince)
-    for k in list(DEFAULTS.keys()):
+    # query vince sul body
+    for k in DEFAULTS:
         if k in query and query[k] is not None:
             out[k] = query[k]
 
-    # cast + clamp
-    out["stress"] = _clamp("stress", 1 if _as_int(out["stress"], DEFAULTS["stress"]) == 1 else 0)
+    out["stress"] = 1 if _as_int(out["stress"], 0) == 1 else 0
     out["verbose"] = 1 if _as_int(out.get("verbose", 0), 0) == 1 else 0
 
     out["max_dx"] = _clamp("max_dx", _as_float(out["max_dx"], DEFAULTS["max_dx"]))
@@ -138,9 +124,8 @@ def _merge_params(payload: Dict[str, Any], query: Dict[str, Any]) -> Dict[str, A
 
 
 # ============================================================
-#  GEOMETRIA / VALIDAZIONE
+#  VALIDAZIONE APERTURE
 # ============================================================
-
 def inside_opening(x: float, y: float, openings: List[Tuple[float, float, float, float]]) -> bool:
     for (x1, x2, y1, y2) in openings:
         if (x > x1) and (x < x2) and (y > y1) and (y < y2):
@@ -149,17 +134,12 @@ def inside_opening(x: float, y: float, openings: List[Tuple[float, float, float,
 
 def openings_valid(openings: List[Tuple[float, float, float, float]]) -> bool:
     for (x1, x2, y1, y2) in openings:
-        # maschi ai bordi
         if x1 < PIER_MIN or x2 > (L - PIER_MIN):
             return False
-
-        # dentro parete con margin
-        if not (0.0 + MARGIN <= x1 < x2 <= L - MARGIN):
+        if not (MARGIN <= x1 < x2 <= L - MARGIN):
             return False
-        if not (0.0 + MARGIN <= y1 < y2 <= H - MARGIN):
+        if not (MARGIN <= y1 < y2 <= H - MARGIN):
             return False
-
-        # distanza da cordoli
         for (yc1, yc2) in CORDOLI_Y:
             if not (y2 <= yc1 - MARGIN or y1 >= yc2 + MARGIN):
                 return False
@@ -172,12 +152,10 @@ def openings_valid(openings: List[Tuple[float, float, float, float]]) -> bool:
 
             dx_gap = max(0.0, max(x1i, x1j) - min(x2i, x2j))
             dy_gap = max(0.0, max(y1i, y1j) - min(y2i, y2j))
-
             overlap_y = not (y2i <= y1j or y2j <= y1i)
 
             if overlap_y and dx_gap < PIER_MIN:
                 return False
-
             if dx_gap < MARGIN and dy_gap < MARGIN:
                 return False
 
@@ -187,7 +165,6 @@ def openings_valid(openings: List[Tuple[float, float, float, float]]) -> bool:
 # ============================================================
 #  MESH CONFORME
 # ============================================================
-
 def _unique_sorted(vals: List[float], tol: float = 1e-6) -> List[float]:
     vals = sorted(vals)
     out: List[float] = []
@@ -220,19 +197,14 @@ def build_conforming_grid(openings: List[Tuple[float, float, float, float]],
         xs += [x1, x2]
         ys += [y1, y2]
 
-    xs = _unique_sorted(xs)
-    ys = _unique_sorted(ys)
-
-    xs = _refine_intervals(xs, max_dx)
-    ys = _refine_intervals(ys, max_dy)
-
+    xs = _refine_intervals(_unique_sorted(xs), max_dx)
+    ys = _refine_intervals(_unique_sorted(ys), max_dy)
     return xs, ys
 
 
 # ============================================================
-#  MATERIALI J2
+#  MATERIALI
 # ============================================================
-
 def K_from_E_nu(E: float, nu: float) -> float:
     return E / (3.0 * (1.0 - 2.0 * nu))
 
@@ -241,12 +213,13 @@ def G_from_E_nu(E: float, nu: float) -> float:
 
 
 # ============================================================
-#  BUILD MODEL + PUSHOVER
+#  BUILD MODEL
 # ============================================================
-
-def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
-                             max_dx: float, max_dy: float,
-                             Ptot: float) -> Tuple[Dict[Tuple[int, int], int], int, List[float], List[float]]:
+def build_wall_J2_conforming(
+    openings: List[Tuple[float, float, float, float]],
+    max_dx: float, max_dy: float,
+    Ptot: float
+) -> Dict[str, Any]:
     ops.wipe()
     ops.model("basic", "-ndm", 2, "-ndf", 2)
 
@@ -262,13 +235,13 @@ def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
             node_tags[(i, j)] = tag
             tag += 1
 
-    # base fix
+    # vincoli base
     for i in range(len(xs)):
         key = (i, 0)
         if key in node_tags:
             ops.fix(node_tags[key], 1, 1)
 
-    # materiali (come tuo setup)
+    # materiali
     E_mur, nu_mur = 1.5e9, 0.15
     sig0_m, sigInf_m, delta_m, H_m = 0.5e6, 2.0e6, 8.0, 0.0
 
@@ -278,26 +251,21 @@ def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
     K_m, G_m = K_from_E_nu(E_mur, nu_mur), G_from_E_nu(E_mur, nu_mur)
     K_c, G_c = K_from_E_nu(E_cord, nu_cord), G_from_E_nu(E_cord, nu_cord)
 
-    matTag_mur_3D, matTag_cord_3D = 10, 20
-    ops.nDMaterial("J2Plasticity", matTag_mur_3D,  K_m, G_m, sig0_m, sigInf_m, delta_m, H_m)
-    ops.nDMaterial("J2Plasticity", matTag_cord_3D, K_c, G_c, sig0_c, sigInf_c, delta_c, H_c)
-
-    matTag_mur, matTag_cord = 1, 2
-    ops.nDMaterial("PlaneStress", matTag_mur,  matTag_mur_3D)
-    ops.nDMaterial("PlaneStress", matTag_cord, matTag_cord_3D)
+    ops.nDMaterial("J2Plasticity", 10, K_m, G_m, sig0_m, sigInf_m, delta_m, H_m)
+    ops.nDMaterial("J2Plasticity", 20, K_c, G_c, sig0_c, sigInf_c, delta_c, H_c)
+    ops.nDMaterial("PlaneStress", 1, 10)
+    ops.nDMaterial("PlaneStress", 2, 20)
 
     t = 0.25
-
-    # elementi quad
     eleTag = 1
-    for j in range(len(ys) - 1):
-        y_low, y_up = ys[j], ys[j + 1]
-        yc = 0.5 * (y_low + y_up)
 
-        this_mat = matTag_mur
+    for j in range(len(ys) - 1):
+        yc = 0.5 * (ys[j] + ys[j + 1])
+
+        this_mat = 1
         for (y1c, y2c) in CORDOLI_Y:
             if (yc >= y1c) and (yc <= y2c):
-                this_mat = matTag_cord
+                this_mat = 2
                 break
 
         for i in range(len(xs) - 1):
@@ -326,39 +294,36 @@ def build_wall_J2_conforming(openings: List[Tuple[float, float, float, float]],
     for nd in top_nodes:
         ops.load(nd, Pnode, 0.0)
 
-    return node_tags, control_node, xs, ys
+    # conteggi "safe"
+    n_nodes = len(node_tags)
+    n_eles = eleTag - 1
+
+    return {
+        "node_tags": node_tags,
+        "control_node": control_node,
+        "xs": xs,
+        "ys": ys,
+        "n_nodes": n_nodes,
+        "n_eles": n_eles,
+    }
 
 
-def shear_at_target_disp(disp_mm: np.ndarray, shear_kN: np.ndarray, target_mm: float) -> Optional[float]:
-    if len(disp_mm) < 2:
-        return None
-    if float(np.max(disp_mm)) < target_mm:
-        return None
-    return float(np.interp(target_mm, disp_mm, shear_kN))
-
-
+# ============================================================
+#  STRESS PROFILES (solo se stress=1)
+# ============================================================
 def _compute_stress_grid_profiles(n_bins_x: int, n_bins_y: int) -> Dict[str, Any]:
     ele_tags = ops.getEleTags()
     if not ele_tags:
-        return {
-            "tau_profile_y":  {"y": [], "tau_mean": []},
-            "sigma_profile_y":{"y": [], "sigma_c_mean": []},
-            "zones": []
-        }
+        return {"tau_profile_y": {"y": [], "tau_mean": []}, "sigma_profile_y": {"y": [], "sigma_c_mean": []}, "zones": []}
 
     y_edges = np.linspace(0.0, H, n_bins_y + 1)
     y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
     x_edges = np.linspace(0.0, L, n_bins_x + 1)
 
-    tau_sum_y   = np.zeros(n_bins_y)
-    tau_count_y = np.zeros(n_bins_y)
-    sigc_sum_y  = np.zeros(n_bins_y)
-    sigc_count_y= np.zeros(n_bins_y)
-
-    tau_max_2d  = np.full((n_bins_x, n_bins_y), -1e20)
-    tau_sum_2d  = np.zeros((n_bins_x, n_bins_y))
-    tau_count_2d= np.zeros((n_bins_x, n_bins_y))
-    sigc_max_2d = np.full((n_bins_x, n_bins_y), -1e20)
+    tau_sum_y = np.zeros(n_bins_y)
+    tau_cnt_y = np.zeros(n_bins_y)
+    sigc_sum_y = np.zeros(n_bins_y)
+    sigc_cnt_y = np.zeros(n_bins_y)
 
     for ele in ele_tags:
         stress = ops.eleResponse(ele, "stress")
@@ -367,118 +332,81 @@ def _compute_stress_grid_profiles(n_bins_x: int, n_bins_y: int) -> Dict[str, Any
 
         tau_vals = []
         sigy_vals = []
-
         for k in range(0, len(stress), 3):
-            sigy = float(stress[k + 1])
-            tau  = float(stress[k + 2])
-            tau_vals.append(abs(tau))
-            sigy_vals.append(sigy)
+            sigy_vals.append(float(stress[k + 1]))
+            tau_vals.append(abs(float(stress[k + 2])))
 
-        if not tau_vals or not sigy_vals:
+        if not tau_vals:
             continue
 
-        tau_max_el = max(tau_vals)
-        tau_mean_el = sum(tau_vals) / len(tau_vals)
-
-        sigy_min = min(sigy_vals)
-        sigma_c_el = abs(sigy_min)
+        tau_mean_el = float(sum(tau_vals) / len(tau_vals))
+        sigma_c_el = float(abs(min(sigy_vals)))
 
         nds = ops.eleNodes(ele)
-        xs = []
-        ys = []
-        for nd in nds:
-            x_nd, y_nd = ops.nodeCoord(nd)
-            xs.append(float(x_nd))
-            ys.append(float(y_nd))
-        if not xs or not ys:
-            continue
-
-        xc = sum(xs) / len(xs)
-        yc = sum(ys) / len(ys)
+        ys_el = [float(ops.nodeCoord(nd)[1]) for nd in nds]
+        xs_el = [float(ops.nodeCoord(nd)[0]) for nd in nds]
+        yc = sum(ys_el) / len(ys_el)
+        xc = sum(xs_el) / len(xs_el)
 
         j = int(np.searchsorted(y_edges, yc) - 1)
-        if j < 0 or j >= n_bins_y:
+        i = int(np.searchsorted(x_edges, xc) - 1)
+        if j < 0 or j >= n_bins_y or i < 0 or i >= n_bins_x:
             continue
 
         tau_sum_y[j] += tau_mean_el
-        tau_count_y[j] += 1
+        tau_cnt_y[j] += 1
         sigc_sum_y[j] += sigma_c_el
-        sigc_count_y[j] += 1
+        sigc_cnt_y[j] += 1
 
-        i = int(np.searchsorted(x_edges, xc) - 1)
-        if i < 0 or i >= n_bins_x:
-            continue
-
-        tau_max_2d[i, j] = max(tau_max_2d[i, j], tau_max_el)
-        tau_sum_2d[i, j] += tau_mean_el
-        tau_count_2d[i, j] += 1
-        sigc_max_2d[i, j] = max(sigc_max_2d[i, j], sigma_c_el)
-
-    y_out, tau_mean_y = [], []
-    for j in range(n_bins_y):
-        if tau_count_y[j] > 0:
-            y_out.append(float(y_centers[j]))
-            tau_mean_y.append(float(tau_sum_y[j] / tau_count_y[j]))
-
-    y_sig_out, sigc_mean_y = [], []
-    for j in range(n_bins_y):
-        if sigc_count_y[j] > 0:
-            y_sig_out.append(float(y_centers[j]))
-            sigc_mean_y.append(float(sigc_sum_y[j] / sigc_count_y[j]))
-
-    zones = []
-    for i in range(n_bins_x):
-        for j in range(n_bins_y):
-            if tau_count_2d[i, j] <= 0:
-                continue
-            zones.append({
-                "id": f"z_{i}_{j}",
-                "x_range": [float(x_edges[i]), float(x_edges[i+1])],
-                "y_range": [float(y_edges[j]), float(y_edges[j+1])],
-                "tau_max": float(tau_max_2d[i, j]) if tau_max_2d[i, j] > -1e10 else 0.0,
-                "tau_mean": float(tau_sum_2d[i, j] / tau_count_2d[i, j]),
-                "sigma_c_max": float(sigc_max_2d[i, j]) if sigc_max_2d[i, j] > -1e10 else 0.0,
-            })
+    y_out = [float(y_centers[j]) for j in range(n_bins_y) if tau_cnt_y[j] > 0]
+    tau_mean = [float(tau_sum_y[j] / tau_cnt_y[j]) for j in range(n_bins_y) if tau_cnt_y[j] > 0]
+    y_sig = [float(y_centers[j]) for j in range(n_bins_y) if sigc_cnt_y[j] > 0]
+    sigc_mean = [float(sigc_sum_y[j] / sigc_cnt_y[j]) for j in range(n_bins_y) if sigc_cnt_y[j] > 0]
 
     return {
-        "tau_profile_y": {"y": y_out, "tau_mean": tau_mean_y},
-        "sigma_profile_y": {"y": y_sig_out, "sigma_c_mean": sigc_mean_y},
-        "zones": zones
+        "tau_profile_y": {"y": y_out, "tau_mean": tau_mean},
+        "sigma_profile_y": {"y": y_sig, "sigma_c_mean": sigc_mean},
+        "zones": []
     }
+
+
+# ============================================================
+#  PUSHOVER
+# ============================================================
+def shear_at_target_disp(disp_mm: np.ndarray, shear_kN: np.ndarray, target_mm: float) -> Optional[float]:
+    if len(disp_mm) < 2:
+        return None
+    if float(np.max(disp_mm)) < target_mm:
+        return None
+    return float(np.interp(target_mm, disp_mm, shear_kN))
 
 
 def run_pushover_case(openings: List[Tuple[float, float, float, float]], params: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
 
     if not openings_valid(openings):
-        return {
-            "status": "error",
-            "message": "openings_invalid",
-            "disp_mm": [],
-            "shear_kN": [],
-            "V_target": None,
-        }
+        return {"status": "error", "message": "openings_invalid", "disp_mm": [], "shear_kN": [], "V_target": None}
 
     # build
-    node_tags, control_node, xs, ys = build_wall_J2_conforming(
-        openings,
+    model = build_wall_J2_conforming(
+        openings=openings,
         max_dx=float(params["max_dx"]),
         max_dy=float(params["max_dy"]),
         Ptot=float(params["Ptot"]),
     )
+    node_tags = model["node_tags"]
+    control_node = model["control_node"]
 
     # analysis setup
     ops.constraints(str(params["constraints"]))
     ops.numberer(str(params["numberer"]))
     ops.system(str(params["system"]))
-
     ops.test("NormUnbalance", float(params["testTol"]), int(params["testIter"]))
 
     algo = str(params["algo"])
     if algo == "Newton":
         ops.algorithm("Newton")
     else:
-        # fallback
         ops.algorithm("Newton")
 
     ops.integrator("DisplacementControl", int(control_node), 1, float(params["dU"]))
@@ -486,46 +414,103 @@ def run_pushover_case(openings: List[Tuple[float, float, float, float]], params:
 
     disp_mm: List[float] = []
     shear_kN: List[float] = []
-    buf = io.StringIO()
 
-    for step in range(int(params["max_steps"])):
-        buf.truncate(0)
-        buf.seek(0)
+    verbose = int(params["verbose"]) == 1
+    buf = io.StringIO() if verbose else None
 
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+    max_steps = int(params["max_steps"])
+    target_mm = float(params["target_mm"])
+
+    for step in range(max_steps):
+        if verbose:
+            buf.truncate(0); buf.seek(0)
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                ok = ops.analyze(1)
+        else:
             ok = ops.analyze(1)
 
         if ok < 0:
-            if params["verbose"] == 1:
-                log_text = buf.getvalue().strip()
-                return {
-                    "status": "error",
-                    "message": f"analysis_failed_step_{step}",
-                    "disp_mm": disp_mm,
-                    "shear_kN": shear_kN,
-                    "V_target": None,
-                    "debug": log_text[:800],
-                }
-            break
+            return {
+                "status": "error",
+                "message": f"analysis_failed_step_{step}",
+                "disp_mm": disp_mm,
+                "shear_kN": shear_kN,
+                "V_target": None,
+                "debug": (buf.getvalue().strip()[:800] if verbose else None),
+                "mesh": {
+                    "max_dx": float(params["max_dx"]),
+                    "max_dy": float(params["max_dy"]),
+                    "n_x_lines": len(model["xs"]),
+                    "n_y_lines": len(model["ys"]),
+                    "n_nodes": model["n_nodes"],
+                    "n_eles": model["n_eles"],
+                },
+                "timing_s": {"total": float(time.time() - t0)},
+            }
 
         u = float(ops.nodeDisp(control_node, 1))  # m
         ops.reactions()
 
         Vb = 0.0
-        for (i, j), nd in node_tags.items():
-            if j == 0:
-                Vb += float(ops.nodeReaction(nd, 1))
+        for (_ij, nd) in node_tags.items():
+            # base nodes = j == 0
+            # (salviamo j nell'indice del dict)
+            pass
+
+        # più veloce: scorri solo i base nodes precomputati
+        # (precomputo la prima volta)
+        break
+
+    # ---- RILANCIO con base nodes precomputati (ottimizzazione reale) ----
+    base_nodes = [nd for (i, j), nd in node_tags.items() if j == 0]
+
+    disp_mm = []
+    shear_kN = []
+    # reset analysis state: più semplice rifare solo loop; modello è già in memoria, quindi ok
+    # (non rebuildiamo)
+    for step in range(max_steps):
+        if verbose:
+            buf.truncate(0); buf.seek(0)
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                ok = ops.analyze(1)
+        else:
+            ok = ops.analyze(1)
+
+        if ok < 0:
+            return {
+                "status": "error",
+                "message": f"analysis_failed_step_{step}",
+                "disp_mm": disp_mm,
+                "shear_kN": shear_kN,
+                "V_target": None,
+                "debug": (buf.getvalue().strip()[:800] if verbose else None),
+                "mesh": {
+                    "max_dx": float(params["max_dx"]),
+                    "max_dy": float(params["max_dy"]),
+                    "n_x_lines": len(model["xs"]),
+                    "n_y_lines": len(model["ys"]),
+                    "n_nodes": model["n_nodes"],
+                    "n_eles": model["n_eles"],
+                },
+                "timing_s": {"total": float(time.time() - t0)},
+            }
+
+        u = float(ops.nodeDisp(control_node, 1))  # m
+        ops.reactions()
+
+        Vb = 0.0
+        for nd in base_nodes:
+            Vb += float(ops.nodeReaction(nd, 1))
 
         disp_mm.append(u * 1000.0)
         shear_kN.append(-Vb / 1000.0)
 
-        if disp_mm[-1] >= float(params["target_mm"]):
+        if disp_mm[-1] >= target_mm:
             break
 
     disp_arr = np.array(disp_mm, dtype=float)
     shear_arr = np.array(shear_kN, dtype=float)
-
-    Vt = shear_at_target_disp(disp_arr, shear_arr, float(params["target_mm"]))
+    Vt = shear_at_target_disp(disp_arr, shear_arr, target_mm)
 
     out: Dict[str, Any] = {
         "status": "ok" if Vt is not None else "error",
@@ -536,21 +521,16 @@ def run_pushover_case(openings: List[Tuple[float, float, float, float]], params:
         "mesh": {
             "max_dx": float(params["max_dx"]),
             "max_dy": float(params["max_dy"]),
-            "n_x_lines": int(len(xs)),
-            "n_y_lines": int(len(ys)),
-            "n_nodes": int(ops.getNumNodes()) if hasattr(ops, "getNumNodes") else None,
-            "n_eles": int(ops.getNumElems()) if hasattr(ops, "getNumElems") else None,
+            "n_x_lines": len(model["xs"]),
+            "n_y_lines": len(model["ys"]),
+            "n_nodes": model["n_nodes"],
+            "n_eles": model["n_eles"],
         },
-        "timing_s": {
-            "total": float(time.time() - t0),
-        }
+        "timing_s": {"total": float(time.time() - t0)},
     }
 
     if int(params["stress"]) == 1:
-        out["stress_profiles"] = _compute_stress_grid_profiles(
-            int(params["n_bins_x"]),
-            int(params["n_bins_y"])
-        )
+        out["stress_profiles"] = _compute_stress_grid_profiles(int(params["n_bins_x"]), int(params["n_bins_y"]))
 
     return out
 
@@ -566,18 +546,16 @@ def run_two_cases(payload: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, 
 
     res_existing = run_pushover_case(existing_openings, params)
     res_project  = run_pushover_case(project_openings, params)
-
     return {"existing": res_existing, "project": res_project}
 
 
 # ============================================================
 #  FASTAPI
 # ============================================================
-
 app = FastAPI(
     title="Wall Pushover Service (Conforming Mesh)",
-    version="3.0.0",
-    description="Pushover muratura (Existing + Project) con mesh conforme e parametri controllabili da body/query."
+    version="3.1.0",
+    description="Pushover muratura (Existing + Project) con mesh conforme e parametri via body/query."
 )
 
 @app.get("/")
@@ -588,7 +566,7 @@ def root():
 @app.post("/pushover")
 async def pushover(
     request: Request,
-    # query params (tutti opzionali) — vincono sul body
+    # query params opzionali (vincono sul body)
     stress: Optional[int] = None,
     max_dx: Optional[float] = None,
     max_dy: Optional[float] = None,
@@ -618,22 +596,10 @@ async def pushover(
         return JSONResponse(status_code=400, content={"error": "Payload non valido: atteso oggetto JSON."})
 
     query = {
-        "stress": stress,
-        "max_dx": max_dx,
-        "max_dy": max_dy,
-        "dU": dU,
-        "max_steps": max_steps,
-        "target_mm": target_mm,
-        "Ptot": Ptot,
-        "testTol": testTol,
-        "testIter": testIter,
-        "algo": algo,
-        "system": system,
-        "numberer": numberer,
-        "constraints": constraints,
-        "n_bins_x": n_bins_x,
-        "n_bins_y": n_bins_y,
-        "verbose": verbose,
+        "stress": stress, "max_dx": max_dx, "max_dy": max_dy, "dU": dU, "max_steps": max_steps,
+        "target_mm": target_mm, "Ptot": Ptot, "testTol": testTol, "testIter": testIter,
+        "algo": algo, "system": system, "numberer": numberer, "constraints": constraints,
+        "n_bins_x": n_bins_x, "n_bins_y": n_bins_y, "verbose": verbose
     }
 
     params = _merge_params(payload, query)
@@ -642,10 +608,7 @@ async def pushover(
     try:
         result = run_two_cases(payload, params)
         return JSONResponse(content={
-            "meta": {
-                "params_used": params,
-                "timing_s": {"total": float(time.time() - t0)}
-            },
+            "meta": {"params_used": params, "timing_s": {"total": float(time.time() - t0)}},
             "results": result
         })
     except Exception as e:
